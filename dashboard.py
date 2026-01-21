@@ -20,17 +20,16 @@ def normalize_columns(df):
 
 def normalize_aloha(df):
     df = df.copy()
-
     df["appt_date"] = pd.to_datetime(df["appt. date"], errors="coerce")
     df["dob"] = pd.to_datetime(df["date of birth"], errors="coerce")
 
     df["start_dt"] = pd.to_datetime(
         df["appt. date"].astype(str) + " " + df["appt. start time"].astype(str),
-        errors="coerce",
+        errors="coerce"
     )
     df["end_dt"] = pd.to_datetime(
         df["appt. date"].astype(str) + " " + df["appt. end time"].astype(str),
-        errors="coerce",
+        errors="coerce"
     )
 
     df["billing hours"] = pd.to_numeric(df["billing hours"], errors="coerce")
@@ -38,11 +37,7 @@ def normalize_aloha(df):
 
 
 def add_week_bucket(df):
-    """
-    Monday → Sunday, Windows/Mac safe formatting
-    """
     df = df.copy()
-
     week_start = df["appt_date"] - pd.to_timedelta(df["appt_date"].dt.weekday, unit="D")
     week_end = week_start + timedelta(days=6)
 
@@ -91,7 +86,6 @@ def merge_case_coordinator(df_aloha, df_zoho):
     z = df_zoho.copy()
     z["dob"] = pd.to_datetime(z["date of birth"], errors="coerce")
 
-    # Primary: Insured ID → Medicaid ID
     df = df.merge(
         z[["medicaid id", "case coordinator name"]],
         left_on="insured id",
@@ -99,7 +93,6 @@ def merge_case_coordinator(df_aloha, df_zoho):
         how="left",
     )
 
-    # Fallback: DOB
     missing = df["case coordinator name"].isna()
     dob_lookup = (
         z[["dob", "case coordinator name"]]
@@ -112,6 +105,9 @@ def merge_case_coordinator(df_aloha, df_zoho):
     return df.drop(columns=["medicaid id"], errors="ignore")
 
 
+# ===============================
+# Pivot
+# ===============================
 def build_weekly_pivot(df):
     pivot = pd.pivot_table(
         df,
@@ -122,290 +118,163 @@ def build_weekly_pivot(df):
         fill_value=0,
     )
 
-    # Flatten columns
-    pivot.columns = [f"{c0} | {c1}" for c0, c1 in pivot.columns]
+    pivot.columns = [f"{a} | {b}" for a, b in pivot.columns]
 
-    # Totals
     yes_cols = [c for c in pivot.columns if c.startswith("Yes |")]
     blank_cols = [c for c in pivot.columns if c.startswith("(blank) |")]
 
-    pivot["Yes Total"] = pivot[yes_cols].sum(axis=1) if yes_cols else 0
-    pivot["(blank) Total"] = pivot[blank_cols].sum(axis=1) if blank_cols else 0
+    pivot["Yes Total"] = pivot[yes_cols].sum(axis=1)
+    pivot["(blank) Total"] = pivot[blank_cols].sum(axis=1)
     pivot["Grand Total"] = pivot["Yes Total"] + pivot["(blank) Total"]
 
     cancel_cols = [
-        c
-        for c in pivot.columns
-        if any(
-            x in c
-            for x in [
-                "Client Cancellation",
-                "Staff Cancellation",
-                "Last Minute",
-                "Other Cancellation",
-            ]
-        )
+        c for c in pivot.columns
+        if any(x in c for x in ["Client Cancellation", "Staff Cancellation", "Last Minute", "Other Cancellation"])
     ]
+    
+    pivot["Cancellation Total"] = pivot[cancel_cols].sum(axis=1)
+    pivot["Cancellation Percentage"] = (pivot["Cancellation Total"] / pivot["Grand Total"] * 100).round(2)
 
-    pivot["Cancellation Percentage"] = (
-        pivot[cancel_cols].sum(axis=1) / pivot["Grand Total"] * 100
-    ).round(2)
+    # --- ADD DIFFERENCE LOGIC ---
+    # We sort by name then week to ensure the diff() compares the same person across time
+    pivot = pivot.reset_index().sort_values(["case coordinator name", "week"])
+    
+    pivot["Difference Yes Total"] = pivot.groupby("case coordinator name")["Yes Total"].diff()
+    pivot["Difference Grand Total"] = pivot.groupby("case coordinator name")["Grand Total"].diff()
+    pivot["Difference Total Cancellation"] = pivot.groupby("case coordinator name")["Cancellation Total"].diff()
 
-    return pivot.reset_index()
+    # Re-sort to keep the week-based view for the UI
+    return pivot.sort_values(["week", "case coordinator name"])
 
 
 # ===============================
-# HTML Renderer (Two Headers + Forced Light Theme)
+# HTML Renderer (UPDATED to include new columns)
 # ===============================
-def pivot_to_two_header_html(pivot_df: pd.DataFrame) -> str:
-    df = pivot_df.copy()
-
-    # Keep week only once per group
-    df["week"] = df["week"].where(df["week"].ne(df["week"].shift()), "")
-
+def render_html(df):
+    df = df.copy()
     yes_cols = [c for c in df.columns if c.startswith("Yes |")]
     blank_cols = [c for c in df.columns if c.startswith("(blank) |")]
 
-    display_cols = (
-        ["week", "case coordinator name"]
-        + yes_cols
-        + (["Yes Total"] if "Yes Total" in df.columns else [])
-        + blank_cols
-        + (["(blank) Total"] if "(blank) Total" in df.columns else [])
-        + (["Grand Total"] if "Grand Total" in df.columns else [])
-        + (["Cancellation Percentage"] if "Cancellation Percentage" in df.columns else [])
-    )
-    df = df[display_cols]
+    def fmt(v, pct=False):
+        if pd.isna(v) or v == "": return ""
+        return f"{v:.2f}" if pct else f"{v:,.2f}"
 
-    # ---------- FORMATTERS ----------
-    def fmt(v, is_pct=False):
-        if v == "" or pd.isna(v):
-            return ""
-        try:
-            v = float(v)
-        except Exception:
-            return str(v)
-        return f"{v:.2f}" if is_pct else f"{v:,.2f}"
-
-    # ---------- GRAND TOTAL ROW ----------
-    numeric_cols = [c for c in df.columns if c not in ["week", "case coordinator name"]]
-
-    grand_totals = {}
-    for c in numeric_cols:
-        if c == "Cancellation Percentage":
-            # recompute from totals if possible
-            if "Grand Total" in df.columns:
-                cancel_cols = [
-                    col for col in df.columns
-                    if any(x in col for x in [
-                        "Client Cancellation",
-                        "Staff Cancellation",
-                        "Last Minute",
-                        "Other Cancellation"
-                    ])
-                ]
-                total_cancel = df[cancel_cols].sum().sum()
-                grand_total = df["Grand Total"].sum()
-                grand_totals[c] = (total_cancel / grand_total * 100) if grand_total else 0
-            else:
-                grand_totals[c] = ""
-        else:
-            grand_totals[c] = df[c].sum()
-
-    # ---------- CSS (DARKER LINES) ----------
     css = """
     <style>
-      .wrap {
-        background: white;
-        padding: 12px;
-        overflow-x: auto;
-      }
-
-      table.pivot {
-        border-collapse: collapse;
-        font-family: Arial, sans-serif;
-        font-size: 13px;
-        background: white !important;
-        color: black !important;
-        border: 2px solid #333;              /* OUTER BORDER */
-      }
-
-      .pivot th, .pivot td {
-        border: 1px solid #999;
-        padding: 6px 10px;
-        white-space: nowrap;
-        background: white !important;
-        color: black !important;
-      }
-
-      .pivot thead th {
-        font-weight: 700;
-        text-align: center;
-        background: #f2f2f2 !important;
-        border-bottom: 2px solid #333;       /* HEADER SEPARATOR */
-      }
-
-      .pivot td.week {
-        font-weight: 700;
-      }
-
-      .pivot td.name {
-        padding-left: 18px;
-      }
-
-      .pivot td.num {
-        text-align: right;
-      }
-
-      /* Totals columns */
-      .pivot th.total,
-      .pivot td.totalcol {
-        background: #efe6c8 !important;
-        font-weight: 700;
-      }
-
-      /* Thick separator between week groups */
-      tr.week-start td {
-        border-top: 2px solid #333 !important;
-      }
-
-      /* Grand total row */
-      tr.grand-total td {
-        border-top: 3px solid #333 !important;
-        font-weight: 700;
-        background: #efe6c8 !important;
-      }
+      table { border-collapse: collapse; font-family: Arial; font-size: 12px; border:2px solid #333; background:white; }
+      th, td { border:1px solid #999; padding:4px 8px; white-space:nowrap; }
+      th { background:#f2f2f2; font-weight:700; text-align:center; }
+      td.num { text-align:right; }
+      tr.week-header td { font-weight:700; background:#eee; border-top:2px solid #333; }
+      tr.grand td { border-top:3px solid #333; background:#efe6c8; font-weight:700; }
+      td.total { background:#f9f9f9; font-weight:700; }
+      td.diff { color: #00008B; font-style: italic; } /* Distinguish diff columns */
     </style>
     """
 
-    # ---------- HEADER ----------
-    header1 = f"""
+    header = f"""
+    <thead>
       <tr>
-        <th rowspan="2" style="text-align:left;">Week W/ SC</th>
-        <th rowspan="2" style="text-align:left;"></th>
+        <th rowspan="2">Week</th>
+        <th rowspan="2">Staff Name</th>
         <th colspan="{len(yes_cols)}">Yes</th>
-        <th rowspan="2" class="total">Yes Total</th>
+        <th rowspan="2">Yes Total</th>
+        <th rowspan="2" style="color:blue">Diff Yes</th>
         <th colspan="{len(blank_cols)}">(blank)</th>
-        <th rowspan="2" class="total">(blank) Total</th>
-        <th rowspan="2" class="total">Grand Total</th>
-        <th rowspan="2" class="total">Cancellation %</th>
+        <th rowspan="2">(blank) Total</th>
+        <th rowspan="2">Grand Total</th>
+        <th rowspan="2">Cancel %</th>
+        <th rowspan="2" style="color:blue">Diff Grand</th>
+        <th rowspan="2" style="color:blue">Diff Cancel</th>
       </tr>
+      <tr>
+        {''.join(f"<th>{c.replace('Yes | ','')}</th>" for c in yes_cols)}
+        {''.join(f"<th>{c.replace('(blank) | ','')}</th>" for c in blank_cols)}
+      </tr>
+    </thead>
     """
 
-    header2 = "<tr>"
-    header2 += "".join(f"<th>{c.replace('Yes | ', '')}</th>" for c in yes_cols)
-    header2 += "".join(f"<th>{c.replace('(blank) | ', '')}</th>" for c in blank_cols)
-    header2 += "</tr>"
+    body = []
+    for week, g in df.groupby("week"):
+        # Week Summary Row
+        body.append(f"<tr class='week-header'><td>{week}</td><td colspan='{len(df.columns)}'></td></tr>")
+        
+        for _, r in g.iterrows():
+            cells = [
+                f"<td></td>",
+                f"<td>{r['case coordinator name']}</td>"
+            ]
+            # Yes Section
+            for c in yes_cols: cells.append(f"<td class='num'>{fmt(r[c])}</td>")
+            cells.append(f"<td class='num total'>{fmt(r['Yes Total'])}</td>")
+            cells.append(f"<td class='num diff'>{fmt(r['Difference Yes Total'])}</td>")
+            
+            # Blank Section
+            for c in blank_cols: cells.append(f"<td class='num'>{fmt(r[c])}</td>")
+            cells.append(f"<td class='num total'>{fmt(r['(blank) Total'])}</td>")
+            
+            # Totals Section
+            cells.append(f"<td class='num total'>{fmt(r['Grand Total'])}</td>")
+            cells.append(f"<td class='num'>{fmt(r['Cancellation Percentage'], True)}</td>")
+            
+            # Differences
+            cells.append(f"<td class='num diff'>{fmt(r['Difference Grand Total'])}</td>")
+            cells.append(f"<td class='num diff'>{fmt(r['Difference Total Cancellation'])}</td>")
+            
+            body.append("<tr>" + "".join(cells) + "</tr>")
 
-    # ---------- BODY ----------
-    body_rows = []
-    prev_week = None
-
-    for _, r in df.iterrows():
-        is_week_start = r["week"] != "" and r["week"] != prev_week
-        prev_week = r["week"] if r["week"] else prev_week
-
-        tr_class = "week-start" if is_week_start else ""
-
-        tds = [
-            f"<td class='week'>{r['week']}</td>",
-            f"<td class='name'>{r['case coordinator name']}</td>",
-        ]
-
-        for c in numeric_cols:
-            is_pct = c == "Cancellation Percentage"
-            cls = "num totalcol" if c in ["Yes Total", "(blank) Total", "Grand Total"] else "num"
-            tds.append(f"<td class='{cls}'>{fmt(r[c], is_pct)}</td>")
-
-        body_rows.append(f"<tr class='{tr_class}'>" + "".join(tds) + "</tr>")
-
-    # ---------- GRAND TOTAL ROW ----------
-    gt_cells = [
-        "<td class='week'>Grand Total</td>",
-        "<td></td>",
+    # Grand Total row (usually diffs aren't summed in a grand total, so we leave those blank)
+    gt = df.select_dtypes("number").sum()
+    grand_cells = [
+        "<td>Grand Total</td><td></td>"
     ]
+    for c in yes_cols: grand_cells.append(f"<td class='num total'>{fmt(gt.get(c, 0))}</td>")
+    grand_cells.append(f"<td class='num total'>{fmt(gt['Yes Total'])}</td>")
+    grand_cells.append("<td></td>") # No diff for grand total
+    for c in blank_cols: grand_cells.append(f"<td class='num total'>{fmt(gt.get(c, 0))}</td>")
+    grand_cells.append(f"<td class='num total'>{fmt(gt['(blank) Total'])}</td>")
+    grand_cells.append(f"<td class='num total'>{fmt(gt['Grand Total'])}</td>")
+    grand_cells.append(f"<td class='num total'>{fmt(df['Cancellation Percentage'].mean(), True)}</td>")
+    grand_cells.extend(["<td></td>", "<td></td>"])
 
-    for c in numeric_cols:
-        is_pct = c == "Cancellation Percentage"
-        cls = "num totalcol"
-        gt_cells.append(f"<td class='{cls}'>{fmt(grand_totals[c], is_pct)}</td>")
+    body.append("<tr class='grand'>" + "".join(grand_cells) + "</tr>")
 
-    body_rows.append("<tr class='grand-total'>" + "".join(gt_cells) + "</tr>")
-
-    html = f"""
-    {css}
-    <div class="wrap">
-      <table class="pivot">
-        <thead>
-          {header1}
-          {header2}
-        </thead>
-        <tbody>
-          {''.join(body_rows)}
-        </tbody>
-      </table>
-    </div>
-    """
-    return html
+    return css + "<table>" + header + "<tbody>" + "".join(body) + "</tbody></table>"
 
 
 # ===============================
-# Upload Files
+# Upload
 # ===============================
-aloha_file = st.file_uploader("Upload Aloha Appointment Billing Info", type=["xlsx"])
-zoho_file = st.file_uploader("Upload Zoho Case List", type=["xlsx"])
+aloha_file = st.file_uploader("Upload Aloha", type=["xlsx"])
+zoho_file = st.file_uploader("Upload Zoho", type=["xlsx"])
 
 if aloha_file and zoho_file:
-    df_aloha = normalize_columns(pd.read_excel(aloha_file))
-    df_zoho = normalize_columns(pd.read_excel(zoho_file))
+    a = normalize_columns(pd.read_excel(aloha_file))
+    z = normalize_columns(pd.read_excel(zoho_file))
 
-    # Prepare Aloha
-    df_aloha = normalize_aloha(df_aloha)
-    df_aloha = add_week_bucket(df_aloha)
-    df_aloha = derive_billing_hours(df_aloha)
+    a = normalize_aloha(a)
+    a = add_week_bucket(a)
+    a = derive_billing_hours(a)
 
-    # Completed: strict Yes vs (blank)
-    df_aloha["completed_flag"] = (
-        df_aloha["completed"]
-        .astype(str)
-        .str.strip()
-        .str.lower()
+    a["completed_flag"] = (
+        a["completed"].astype(str).str.strip().str.lower()
         .apply(lambda x: "Yes" if x == "yes" else "(blank)")
     )
 
-    # Merge Zoho
-    df = merge_case_coordinator(df_aloha, df_zoho)
-
-    # Cancellation bucket
+    df = merge_case_coordinator(a, z)
     df["cancel_bucket"] = df["appointment status"].apply(classify_cancel_bucket)
 
-    # Pivot
-    pivot_df = build_weekly_pivot(df)
+    pivot = build_weekly_pivot(df)
 
-    # Render HTML (properly, not as code)
-    html = pivot_to_two_header_html(pivot_df)
-    components.html(html, height=750, scrolling=True)
+    html = render_html(pivot)
+    components.html(html, height=900, scrolling=True)
 
-    # Download HTML export
-    st.download_button(
-        "⬇️ Download HTML",
-        data=html.encode("utf-8"),
-        file_name="weekly_cancellation_pivot.html",
-        mime="text/html",
-    )
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        pivot.to_excel(w, index=False)
+    out.seek(0)
 
-    # Export Excel (raw pivot)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pivot_df.to_excel(writer, index=False, sheet_name="Pivot")
-    output.seek(0)
-
-    st.download_button(
-        "⬇️ Download Excel",
-        data=output,
-        file_name="weekly_cancellation_pivot.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    st.download_button("⬇️ Download Excel", out, "weekly_pivot.xlsx")
 
 else:
-    st.info("Please upload both Aloha and Zoho Excel files to continue.")
+    st.info("Upload both files.")

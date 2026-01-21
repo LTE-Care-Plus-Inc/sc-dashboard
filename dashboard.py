@@ -3,6 +3,7 @@ import streamlit as st
 from datetime import timedelta
 import io
 import streamlit.components.v1 as components
+import openpyxl
 
 # ===============================
 # Streamlit Setup
